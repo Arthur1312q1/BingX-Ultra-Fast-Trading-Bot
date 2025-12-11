@@ -136,6 +136,8 @@ def instant_trade(action, quantity):
         is_entry = action.startswith('ENTER')
         is_long = 'LONG' in action
         
+        print(f"🔄 Starting trade: {action} with quantity {quantity}")
+        
         # ====================================================================
         # EXIT: FECHAMENTO CEGO (BLIND CLOSE) - SEM CONSULTA DE POSIÇÃO
         # ====================================================================
@@ -157,16 +159,20 @@ def instant_trade(action, quantity):
             }
             params['signature'] = sign(params)
             
+            print(f"📤 Sending EXIT order to BingX...")
+            
             # USA SESSION (conexão persistente)
             # SEM headers (já definidos globalmente)
             r = session.post(
                 f"{BASE_URL}/openApi/swap/v2/trade/order",
                 json=params,
-                timeout=1
+                timeout=2
             )
             
             elapsed = (time.time() - start) * 1000
             result = r.json()
+            
+            print(f"📥 BingX response: {result}")
             
             if result.get('code') == 0:
                 print(f"⚡ EXIT {'LONG' if is_long else 'SHORT'}: {qty} | {elapsed:.0f}ms")
@@ -180,16 +186,20 @@ def instant_trade(action, quantity):
         # ====================================================================
         else:
             # Preço (do cache se possível)
+            print(f"💰 Getting price...")
             price = get_price()
             if price == 0:
                 print("❌ Failed to get price")
                 return False
+            print(f"✅ Price: ${price}")
             
             # Saldo (do cache se possível)
+            print(f"💵 Getting balance...")
             balance = get_balance()
             if balance == 0:
                 print("❌ Failed to get balance")
                 return False
+            print(f"✅ Balance: ${balance}")
             
             # Quantidade: se quantity < 1, é percentual; se >= 1, é quantidade fixa
             if quantity < 1:
@@ -203,6 +213,8 @@ def instant_trade(action, quantity):
                 print("❌ Quantity too small")
                 return False
             
+            print(f"📊 Calculated quantity: {qty} {SYMBOL}")
+            
             # ORDEM A MERCADO (INSTANTÂNEA)
             params = {
                 'symbol': SYMBOL,
@@ -214,16 +226,20 @@ def instant_trade(action, quantity):
             }
             params['signature'] = sign(params)
             
+            print(f"📤 Sending ENTRY order to BingX...")
+            
             # USA SESSION (conexão persistente)
             # SEM headers (já definidos globalmente)
             r = session.post(
                 f"{BASE_URL}/openApi/swap/v2/trade/order",
                 json=params,
-                timeout=1
+                timeout=2
             )
             
             elapsed = (time.time() - start) * 1000
             result = r.json()
+            
+            print(f"📥 BingX response: {result}")
             
             if result.get('code') == 0:
                 print(f"⚡ ENTER {'LONG' if is_long else 'SHORT'}: {qty} @ ${price} | {elapsed:.0f}ms")
@@ -235,6 +251,8 @@ def instant_trade(action, quantity):
     except Exception as e:
         elapsed = (time.time() - start) * 1000
         print(f"❌ Error after {elapsed:.0f}ms: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # ============================================================================
@@ -245,48 +263,80 @@ def webhook():
     """
     RECEBE MENSAGENS DO TRADINGVIEW
     
-    FORMATO ESPERADO:
-    {"message": "ENTER-LONG_0.40"}    -> Entrada LONG com 40% do saldo
-    {"message": "ENTER-SHORT_0.30"}   -> Entrada SHORT com 30% do saldo
-    {"message": "EXIT-LONG_0.156"}    -> Saída LONG de 0.156 ETH
-    {"message": "EXIT-SHORT_0.089"}   -> Saída SHORT de 0.089 ETH
-    
-    OU (formato antigo ainda suportado):
-    "ENTER-LONG_BingX_ETH-USDT_trade_45M_ID"  -> Entrada LONG com 40% (padrão)
+    FORMATOS ACEITOS:
+    1. {"message": "ENTER-LONG_0.40"}
+    2. "ENTER-LONG_0.40"
+    3. "ENTER-LONG_BingX_ETH-USDT_trade_45M_ID"
+    4. Qualquer string com ENTER-LONG, ENTER-SHORT, EXIT-LONG, EXIT-SHORT
     """
     start = time.time()
     
     try:
-        data = request.get_json(force=True)
+        # Tentar pegar dados de múltiplas formas
+        message = None
         
-        # Suporta tanto JSON quanto string pura
-        if isinstance(data, dict):
-            message = data.get('message', '')
-        else:
-            message = data
+        # Tentativa 1: JSON com campo "message"
+        try:
+            data = request.get_json(force=True)
+            if isinstance(data, dict):
+                message = data.get('message', '')
+            elif isinstance(data, str):
+                message = data
+        except:
+            pass
         
-        if not message or '_' not in message:
-            return jsonify({"error": "Invalid message"}), 400
-        
-        # Parse: ENTER-LONG_0.40 ou EXIT-SHORT_0.156
-        parts = message.split('_')
-        action = parts[0]  # ENTER-LONG, ENTER-SHORT, EXIT-LONG, EXIT-SHORT
-        
-        # Extrair quantidade (se fornecida)
-        if len(parts) > 1:
+        # Tentativa 2: Texto puro (raw body)
+        if not message:
             try:
-                # Tenta converter segundo campo para float
-                quantity = float(parts[1])
+                message = request.data.decode('utf-8')
             except:
-                # Fallback: formato antigo sem quantidade
-                quantity = 0.40  # 40% padrão para ENTRY
-        else:
-            quantity = 0.40  # Padrão
+                pass
         
-        # Validar ação
-        valid_actions = ['ENTER-LONG', 'ENTER-SHORT', 'EXIT-LONG', 'EXIT-SHORT']
-        if action not in valid_actions:
-            return jsonify({"error": f"Invalid action: {action}"}), 400
+        # Tentativa 3: Form data
+        if not message:
+            try:
+                message = request.form.get('message', '')
+            except:
+                pass
+        
+        # Log para debug
+        print(f"📨 Received: {message}")
+        
+        if not message:
+            return jsonify({"error": "No message received"}), 400
+        
+        # Extrair ação (ENTER-LONG, EXIT-SHORT, etc)
+        message_upper = message.upper()
+        action = None
+        
+        if 'ENTER-LONG' in message_upper or 'ENTER_LONG' in message_upper:
+            action = 'ENTER-LONG'
+        elif 'ENTER-SHORT' in message_upper or 'ENTER_SHORT' in message_upper:
+            action = 'ENTER-SHORT'
+        elif 'EXIT-LONG' in message_upper or 'EXIT_LONG' in message_upper:
+            action = 'EXIT-LONG'
+        elif 'EXIT-SHORT' in message_upper or 'EXIT_SHORT' in message_upper:
+            action = 'EXIT-SHORT'
+        
+        if not action:
+            return jsonify({"error": f"Invalid action in message: {message}"}), 400
+        
+        # Extrair quantidade (tentar encontrar número após _ ou usar padrão)
+        quantity = 0.40  # Padrão: 40% do saldo
+        
+        if '_' in message:
+            parts = message.split('_')
+            for part in parts[1:]:  # Ignora primeira parte (ação)
+                try:
+                    num = float(part)
+                    if 0 < num <= 100:  # Número válido encontrado
+                        quantity = num if num < 1 else num / 100  # Converte % se necessário
+                        break
+                except:
+                    continue
+        
+        # Log para debug
+        print(f"🎯 Action: {action}, Quantity: {quantity}")
         
         # EXECUTAR EM BACKGROUND
         Thread(target=instant_trade, args=(action, quantity), daemon=True).start()
@@ -301,6 +351,7 @@ def webhook():
         }), 200
         
     except Exception as e:
+        print(f"❌ Webhook error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 # ============================================================================
