@@ -1,61 +1,43 @@
 #!/usr/bin/env python3
 """
-BingX Ultra-Fast Trading Bot
+BingX Ultra-Fast Trading Bot - Render Optimized
 Target: <50ms execution time
+Python 3.13+ Compatible
 """
-import asyncio
 import os
 import sys
-import ujson as json
-from fastapi import FastAPI
-import uvicorn
-from contextlib import asynccontextmanager
-import logging
 
-# Otimização máxima - desabilitar logs em produção
-logging.getLogger().setLevel(logging.WARNING)
+# Verificar variáveis de ambiente críticas no startup
+required_vars = ['BINGX_API_KEY', 'BINGX_SECRET_KEY']
+missing_vars = [var for var in required_vars if not os.getenv(var)]
 
-# Importações otimizadas
-from hyperfast_server import app, lifespan, startup_tasks
+if missing_vars:
+    print(f"❌ ERROR: Missing environment variables: {', '.join(missing_vars)}")
+    print("Please set these in Render Dashboard → Environment")
+    sys.exit(1)
 
-# Configurações de performance
-os.environ['PYTHONASYNCIODEBUG'] = '0'
-os.environ['UVICORN_ACCESS_LOG'] = '0'
+print(f"✅ Environment variables loaded successfully")
+print(f"✅ Python version: {sys.version}")
+print(f"✅ Bot starting on port: {os.getenv('PORT', 8000)}")
 
-# Criar app com lifespan otimizado
-app = FastAPI(
-    lifespan=lifespan,
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None
-)
+# Agora importar o app
+from hyperfast_server import app
 
-# Incluir rotas do webhook
-from hyperfast_server import router
-app.include_router(router)
-
-@app.get("/")
-async def root():
-    return {"status": "ultra-fast", "target": "<50ms"}
-
+# Para execução direta via python main.py
 if __name__ == "__main__":
-    # Configuração ultra-otimizada
-    config = uvicorn.Config(
+    import uvicorn
+    
+    port = int(os.getenv("PORT", 8000))
+    
+    # Configurações otimizadas sem uvloop/httptools
+    uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        loop="uvloop",
-        http="httptools",
-        ws="none",
-        lifespan="on",
+        port=port,
+        workers=1,
         access_log=False,
-        log_level="warning",
         timeout_keep_alive=5,
-        limit_concurrency=1000,
-        limit_max_requests=10000,
-        reload=False,
-        workers=1  # Single worker para evitar race conditions
+        log_level="warning",
+        loop="asyncio",
+        http="auto"
     )
-    
-    server = uvicorn.Server(config)
-    server.run()
