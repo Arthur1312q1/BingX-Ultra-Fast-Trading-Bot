@@ -2,6 +2,7 @@ services:
   - type: web
     name: bingx-ultra-fast-trading-bot
     env: python
+    region: oregon  # Escolha a região mais próxima da BingX
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
@@ -10,8 +11,13 @@ services:
       - key: BINGX_SECRET_KEY
         sync: false
     healthCheckPath: /status
+    healthCheckTimeout: 3
     autoDeploy: true
     scaling:
       minInstances: 1
       maxInstances: 1
-    plan: starter  # Use starter para melhor performance
+    plan: starter
+    disk:
+      name: tmp
+      mountPath: /tmp
+      sizeGB: 1
