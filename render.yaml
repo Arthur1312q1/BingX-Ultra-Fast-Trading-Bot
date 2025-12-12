@@ -3,7 +3,7 @@ services:
     name: bingx-lightning-executor
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --loop uvloop --workers 1 --log-level error
+    startCommand: python -m uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --log-level error
     envVars:
       - key: BINGX_API_KEY
         sync: false
