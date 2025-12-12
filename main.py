@@ -7,7 +7,7 @@ Python 3.13+ Compatible
 import os
 import sys
 
-# Verificar variáveis de ambiente críticas no startup
+# Verificar variáveis de ambiente críticas
 required_vars = ['BINGX_API_KEY', 'BINGX_SECRET_KEY']
 missing_vars = [var for var in required_vars if not os.getenv(var)]
 
@@ -23,21 +23,21 @@ print(f"✅ Bot starting on port: {os.getenv('PORT', 8000)}")
 # Agora importar o app
 from hyperfast_server import app
 
-# Para execução direta via python main.py
 if __name__ == "__main__":
     import uvicorn
     
     port = int(os.getenv("PORT", 8000))
     
-    # Configurações otimizadas sem uvloop/httptools
+    # Configurações otimizadas para Render
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=port,
-        workers=1,
-        access_log=False,
+        workers=1,  # Single worker para evitar race conditions
+        access_log=False,  # Desabilitar logs para performance
         timeout_keep_alive=5,
         log_level="warning",
         loop="asyncio",
-        http="auto"
+        http="auto",
+        reload=False
     )
