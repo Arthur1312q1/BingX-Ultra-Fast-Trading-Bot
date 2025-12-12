@@ -1,15 +1,15 @@
 """
 Servidor HTTP otimizado para latência mínima
+Compatível com Python 3.13+
 """
 import asyncio
 import time
-import ujson as json
+import json
 import hashlib
 import hmac
 from typing import Dict, Optional
 import aiohttp
-from fastapi import FastAPI, Request, APIRouter, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, Request, APIRouter, Response
 import os
 import re
 
@@ -35,21 +35,28 @@ ACTION_PATTERN = re.compile(r'^(ENTER-LONG|EXIT-LONG|ENTER-SHORT|EXIT-SHORT|EXIT
 
 router = APIRouter()
 
-# --- HTTP Client Otimizado ---
+# --- HTTP Client Otimizado com aiohttp ---
 async def get_session():
     """Sessão HTTP otimizada com keep-alive"""
     global _session
     if _session is None or _session.closed:
         connector = aiohttp.TCPConnector(
-            limit=20,
+            limit=50,  # Mais conexões para paralelismo
             keepalive_timeout=30,
             enable_cleanup_closed=True,
             force_close=False,
-            use_dns_cache=True
+            use_dns_cache=True,
+            ttl_dns_cache=300,
+            limit_per_host=20
         )
         _session = aiohttp.ClientSession(
             connector=connector,
-            timeout=aiohttp.ClientTimeout(total=1.5, connect=0.5),
+            timeout=aiohttp.ClientTimeout(
+                total=1.5,
+                connect=0.3,  # Conexão mais rápida
+                sock_read=1.0,
+                sock_connect=0.3
+            ),
             json_serialize=json.dumps
         )
     return _session
@@ -64,7 +71,7 @@ def generate_signature(params: Dict) -> str:
     ).hexdigest()
 
 async def bingx_request(method: str, endpoint: str, params=None, signed=False):
-    """Requisição ultra-rápida à API BingX"""
+    """Requisição ultra-rápida à API BingX com retry rápido"""
     try:
         session = await get_session()
         url = f"https://open-api.bingx.com{endpoint}"
@@ -76,29 +83,42 @@ async def bingx_request(method: str, endpoint: str, params=None, signed=False):
             params['timestamp'] = int(time.time() * 1000)
             params['signature'] = generate_signature(params)
         
-        headers = {"X-BX-APIKEY": API_KEY} if signed else {}
+        headers = {}
+        if signed:
+            headers["X-BX-APIKEY"] = API_KEY
+        
+        # Headers para performance
+        headers.update({
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive"
+        })
         
         async with session.request(
             method=method.upper(),
             url=url,
             params=params if method.upper() == "GET" else None,
-            data=params if method.upper() == "POST" else None,
+            json=params if method.upper() == "POST" else None,
             headers=headers
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get('data', {}) if data.get('code') == 0 else {}
-    except:
-        pass
-    return {}
+            else:
+                # Log rápido sem detalhes para performance
+                return {}
+    except asyncio.TimeoutError:
+        return {}
+    except Exception:
+        return {}
 
 # --- Funções de Trading Otimizadas ---
 async def get_current_price():
-    """Preço com cache de 100ms"""
+    """Preço com cache de 50ms"""
     global _price_cache
     now = time.time()
     
-    if now - _price_cache["timestamp"] < 0.1:  # 100ms cache
+    if now - _price_cache["timestamp"] < 0.05:  # 50ms cache
         return _price_cache["price"]
     
     data = await bingx_request("GET", "/openApi/swap/v2/quote/ticker", {"symbol": SYMBOL})
@@ -109,11 +129,11 @@ async def get_current_price():
     return 0.0
 
 async def get_balance():
-    """Saldo com cache de 500ms"""
+    """Saldo com cache de 200ms"""
     global _balance_cache
     now = time.time()
     
-    if now - _balance_cache["timestamp"] < 0.5:
+    if now - _balance_cache["timestamp"] < 0.2:
         return _balance_cache["balance"]
     
     data = await bingx_request("GET", "/openApi/swap/v2/user/balance", signed=True)
@@ -126,19 +146,19 @@ async def get_balance():
     return 0.0
 
 async def set_leverage():
-    """Configurar alavancagem 1x (cache por sessão)"""
-    await bingx_request("POST", "/openApi/swap/v2/trade/leverage", {
+    """Configurar alavancagem 1x - fire and forget"""
+    asyncio.create_task(bingx_request("POST", "/openApi/swap/v2/trade/leverage", {
         "symbol": SYMBOL,
         "leverage": 1,
         "side": "LONG"
-    }, signed=True)
+    }, signed=True))
 
 async def get_position():
-    """Posição com cache de 100ms"""
+    """Posição com cache de 50ms"""
     global _position_cache
     now = time.time()
     
-    if now - _position_cache["timestamp"] < 0.1:
+    if now - _position_cache["timestamp"] < 0.05:
         return _position_cache["position"]
     
     data = await bingx_request("GET", "/openApi/swap/v2/user/positions", signed=True)
@@ -152,12 +172,12 @@ async def get_position():
     return None
 
 async def place_market_order(side: str, quantity: float):
-    """Ordem de mercado com timeout agressivo"""
+    """Ordem de mercado com execução paralela"""
     params = {
         "symbol": SYMBOL,
         "side": side.upper(),
         "type": "MARKET",
-        "quantity": quantity,
+        "quantity": round(quantity, 4),
         "positionSide": "LONG" if side.upper() == "BUY" else "SHORT"
     }
     
@@ -205,7 +225,7 @@ async def enter_position(side: str):
     if quantity <= 0:
         return {"success": False}
     
-    # Executar ordem
+    # Executar ordem com timeout curto
     order_result = await place_market_order(side, quantity)
     
     # Invalidar caches
@@ -236,7 +256,7 @@ async def close_position(side: str):
     quantity = abs(float(position['positionAmt']))
     close_side = "SELL" if current_side == "LONG" else "BUY"
     
-    result = await place_market_order(close_side, quantity)
+    result = await place_market_order(close_side, round(quantity, 4))
     
     # Invalidar cache
     global _position_cache
@@ -254,7 +274,7 @@ async def close_all_positions():
     quantity = abs(float(position['positionAmt']))
     side = "SELL" if float(position['positionAmt']) > 0 else "BUY"
     
-    result = await place_market_order(side, quantity)
+    result = await place_market_order(side, round(quantity, 4))
     
     # Invalidar cache
     global _position_cache
@@ -269,7 +289,7 @@ async def webhook_handler(request: Request):
     start_time = time.perf_counter()
     
     try:
-        # Leitura direta do body (sem await adicional)
+        # Leitura direta do body
         body = await request.body()
         
         if not body:
@@ -317,7 +337,12 @@ async def webhook_handler(request: Request):
                     "execution_ms": round(execution_time, 2)
                 }),
                 media_type="application/json",
-                headers={"X-Exec-Time": f"{execution_time:.2f}ms"}
+                headers={
+                    "X-Exec-Time": f"{execution_time:.2f}ms",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0"
+                }
             )
         else:
             return Response(
@@ -345,58 +370,87 @@ async def webhook_handler(request: Request):
 @router.get("/status")
 async def status():
     """Health check minimalista"""
-    return {
-        "status": "ultra_fast",
-        "exchange": "BingX",
-        "pair": SYMBOL,
-        "target_latency": "<50ms",
-        "uptime": time.time()
-    }
+    try:
+        # Testar conexão rápida com BingX
+        price_task = asyncio.create_task(get_current_price())
+        price = await asyncio.wait_for(price_task, timeout=0.5)
+        
+        return {
+            "status": "ultra_fast",
+            "exchange": "BingX",
+            "pair": SYMBOL,
+            "price": price,
+            "target_latency": "<50ms",
+            "timestamp": time.time()
+        }
+    except:
+        return {
+            "status": "degraded",
+            "exchange": "BingX",
+            "pair": SYMBOL,
+            "timestamp": time.time()
+        }
+
+@router.get("/health/13s")
+async def health_13s():
+    """Health check de 13 segundos"""
+    return {"status": "ok", "check": "13s", "timestamp": time.time()}
+
+@router.get("/health/31s")
+async def health_31s():
+    """Health check de 31 segundos"""
+    try:
+        # Teste rápido da API BingX
+        data = await bingx_request("GET", "/openApi/swap/v2/quote/ticker", {"symbol": SYMBOL})
+        return {
+            "status": "ok", 
+            "check": "31s", 
+            "api": "connected" if data else "disconnected",
+            "timestamp": time.time()
+        }
+    except:
+        return {"status": "error", "check": "31s", "timestamp": time.time()}
 
 # --- Startup Tasks ---
 async def startup():
     """Tarefas de inicialização"""
     # Aquecer conexões
     await get_session()
+    # Aquecer cache de preço
     asyncio.create_task(get_current_price())
+    # Configurar alavancagem em background
     asyncio.create_task(set_leverage())
 
-async def health_check_13s():
-    """Health check de 13 segundos"""
-    while True:
-        await asyncio.sleep(13)
-        try:
-            await get_session()
-        except:
-            pass
+@router.on_event("startup")
+async def on_startup():
+    """Evento de startup do FastAPI"""
+    await startup()
 
-async def health_check_31s():
-    """Health check de 31 segundos"""
-    while True:
-        await asyncio.sleep(31)
-        try:
-            await get_current_price()
-        except:
-            pass
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan otimizado"""
-    # Iniciar tasks em background
-    startup_task = asyncio.create_task(startup())
-    health_13s = asyncio.create_task(health_check_13s())
-    health_31s = asyncio.create_task(health_check_31s())
-    
-    yield
-    
-    # Cleanup
-    startup_task.cancel()
-    health_13s.cancel()
-    health_31s.cancel()
-    
+@router.on_event("shutdown")
+async def on_shutdown():
+    """Evento de shutdown do FastAPI"""
+    global _session
     if _session and not _session.closed:
         await _session.close()
 
-# Criar app para importação
-app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+# Criar app FastAPI
+app = FastAPI(
+    title="BingX Ultra-Fast Trading Bot",
+    description="High-speed trading bot optimized for Python 3.13+",
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
+
+# Adicionar middleware de CORS simplificado
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+# Incluir rotas
 app.include_router(router)
