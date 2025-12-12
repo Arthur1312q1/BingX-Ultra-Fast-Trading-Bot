@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: bingx-ultra-fast-trading-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BINGX_API_KEY
+        sync: false
+      - key: BINGX_SECRET_KEY
+        sync: false
+    healthCheckPath: /status
+    autoDeploy: true
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    plan: starter  # Use starter para melhor performance
