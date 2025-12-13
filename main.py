@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
-BingX Trading Bot - Versão Simplificada
+BingX Trading Bot - Versão Funcional
 """
 import os
 import sys
 
 print("=" * 60)
-print("🚀 BINGX TRADING BOT - INICIANDO")
+print("🤖 BINGX TRADING BOT - INICIANDO")
 print("=" * 60)
 
 # Verificar variáveis
-if not os.getenv('BINGX_API_KEY') or not os.getenv('BINGX_SECRET_KEY'):
-    print("❌ ERRO: Configure BINGX_API_KEY e BINGX_SECRET_KEY no Render!")
+if not os.getenv('BINGX_API_KEY'):
+    print("❌ ERRO: BINGX_API_KEY não configurada!")
+    print("Configure no Render Dashboard → Environment")
     sys.exit(1)
 
-print(f"✅ Credenciais configuradas")
-print(f"✅ Porta: {os.getenv('PORT', 8000)}")
-print(f"✅ URL: https://bingx-ultra-fast-trading-bot.onrender.com")
+if not os.getenv('BINGX_SECRET_KEY'):
+    print("❌ ERRO: BINGX_SECRET_KEY não configurada!")
+    print("Configure no Render Dashboard → Environment")
+    sys.exit(1)
 
-# Importar app
+print("✅ Credenciais carregadas com sucesso")
+print(f"📡 URL: https://bingx-ultra-fast-trading-bot.onrender.com")
+print(f"🚪 Porta: {os.getenv('PORT', 8000)}")
+
+# Importar e iniciar servidor
 from hyperfast_server import app
 
 if __name__ == "__main__":
@@ -26,7 +32,7 @@ if __name__ == "__main__":
     
     port = int(os.getenv("PORT", 8000))
     
-    # Iniciar servidor simples
+    # Configuração para Render
     uvicorn.run(
         app,
         host="0.0.0.0",
