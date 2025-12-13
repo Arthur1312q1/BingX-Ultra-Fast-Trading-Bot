@@ -1,6 +1,0 @@
-Dockerfile
-docker-compose.yml
-.env
-*.log
-__pycache__/
-*.pyc
