@@ -1,5 +1,5 @@
 """
-Servidor HTTP com sistema completo de health checks
+Servidor HTTP com logs detalhados para debug
 """
 import asyncio
 import time
@@ -8,326 +8,633 @@ import hashlib
 import hmac
 from typing import Dict, Optional, Any
 import aiohttp
-from fastapi import FastAPI, Request, APIRouter, Response, BackgroundTasks
+from fastapi import FastAPI, Request, APIRouter, Response
 import os
 import re
+from datetime import datetime
 
-# Configurações
+# ========== CONFIGURAÇÃO ==========
 API_KEY = os.getenv("BINGX_API_KEY")
 SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
 SYMBOL = "ETH-USDT"
 
-# Cache de performance
+# ========== SISTEMA DE LOGS ==========
+class TradingLogger:
+    def __init__(self):
+        self.logs = []
+        self.max_logs = 100
+        
+    def log(self, level: str, message: str, data: dict = None):
+        """Registra log com timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        log_entry = {
+            "timestamp": timestamp,
+            "level": level,
+            "message": message,
+            "data": data
+        }
+        
+        print(f"[{timestamp}] [{level}] {message}")
+        if data:
+            print(f"    Dados: {data}")
+        
+        self.logs.append(log_entry)
+        if len(self.logs) > self.max_logs:
+            self.logs.pop(0)
+    
+    def get_recent_logs(self, limit: int = 20):
+        """Retorna logs recentes"""
+        return self.logs[-limit:] if self.logs else []
+
+logger = TradingLogger()
+
+# ========== CACHE E ESTATÍSTICAS ==========
 _cache = {
-    "price": {"value": 0.0, "timestamp": 0, "ttl": 0.05},  # 50ms
-    "balance": {"value": 0.0, "timestamp": 0, "ttl": 0.5},  # 500ms
-    "position": {"value": None, "timestamp": 0, "ttl": 0.05},  # 50ms
+    "price": {"value": 0.0, "timestamp": 0},
+    "balance": {"value": 0.0, "timestamp": 0},
+    "position": {"value": None, "timestamp": 0},
 }
 
-# Contadores para monitoramento
 _metrics = {
     "webhooks_received": 0,
     "trades_executed": 0,
     "errors": 0,
-    "start_time": time.time()
+    "start_time": time.time(),
+    "last_webhook_time": 0,
+    "last_trade_time": 0
 }
 
-# Processamento de sinais
 _processed_signals = set()
 
-# Regex
+# ========== REGEX ==========
 SIGNAL_PATTERN = re.compile(
     r'^(ENTER-LONG|EXIT-LONG|ENTER-SHORT|EXIT-SHORT|EXIT-ALL)_'
-    r'BingX_ETH-USDT_[^_]+_\d+M_[\da-f]+$'
+    r'BingX_ETH-USDT_([^_]+)_(\d+M)_([a-f0-9]+)$'
 )
 
 router = APIRouter()
 
-# ========== SISTEMA DE HEALTH CHECKS INTERNOS ==========
-class HealthMonitor:
-    def __init__(self):
-        self.last_13s_check = 0
-        self.last_31s_check = 0
-        self.checks_13s = 0
-        self.checks_31s = 0
-        
-    def check_13s(self):
-        """Registra check de 13 segundos"""
-        self.last_13s_check = time.time()
-        self.checks_13s += 1
-        return True
-        
-    def check_31s(self):
-        """Registra check de 31 segundos"""
-        self.last_31s_check = time.time()
-        self.checks_31s += 1
-        return True
-        
-    def get_status(self):
-        """Retorna status do monitor"""
-        return {
-            "13s": {
-                "last_check": self.last_13s_check,
-                "checks": self.checks_13s,
-                "active": (time.time() - self.last_13s_check) < 20  # 20s de tolerância
-            },
-            "31s": {
-                "last_check": self.last_31s_check,
-                "checks": self.checks_31s,
-                "active": (time.time() - self.last_31s_check) < 40  # 40s de tolerância
-            }
-        }
+# ========== CLIENTE HTTP ==========
+_session = None
 
-health_monitor = HealthMonitor()
+async def get_session():
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5)
+        )
+    return _session
+
+def generate_signature(params: Dict) -> str:
+    query = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
+    return hmac.new(
+        SECRET_KEY.encode(),
+        query.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+async def bingx_request(method: str, endpoint: str, params=None, signed=False) -> Any:
+    """Faz requisição à API BingX com logs detalhados"""
+    try:
+        session = await get_session()
+        url = f"https://open-api.bingx.com{endpoint}"
+        
+        if params is None:
+            params = {}
+        
+        if signed:
+            params['timestamp'] = int(time.time() * 1000)
+            params['signature'] = generate_signature(params)
+        
+        headers = {"X-BX-APIKEY": API_KEY} if signed else {}
+        
+        logger.log("DEBUG", f"Enviando requisição para {url}", {
+            "method": method,
+            "params": params,
+            "signed": signed
+        })
+        
+        start_time = time.perf_counter()
+        
+        async with session.request(
+            method=method,
+            url=url,
+            params=params if method == "GET" else None,
+            json=params if method == "POST" else None,
+            headers=headers
+        ) as response:
+            response_time = (time.perf_counter() - start_time) * 1000
+            
+            if response.status == 200:
+                data = await response.json()
+                logger.log("DEBUG", f"Resposta recebida em {response_time:.2f}ms", {
+                    "endpoint": endpoint,
+                    "code": data.get('code'),
+                    "has_data": 'data' in data
+                })
+                
+                if data.get('code') == 0:
+                    return data.get('data', {})
+                else:
+                    logger.log("ERROR", f"API retornou erro", {
+                        "code": data.get('code'),
+                        "msg": data.get('msg'),
+                        "endpoint": endpoint
+                    })
+                    return None
+            else:
+                logger.log("ERROR", f"HTTP {response.status}", {
+                    "endpoint": endpoint,
+                    "text": await response.text()
+                })
+                return None
+                
+    except Exception as e:
+        logger.log("ERROR", f"Erro na requisição", {
+            "endpoint": endpoint,
+            "error": str(e)
+        })
+        return None
 
 # ========== FUNÇÕES DE TRADING ==========
-async def get_session():
-    """Sessão HTTP otimizada"""
-    # Implementação anterior mantida
-    pass
-
-async def bingx_request(method: str, endpoint: str, params=None, signed=False):
-    """Requisição à API BingX"""
-    # Implementação anterior mantida
-    pass
-
 async def get_current_price():
-    """Obtém preço atual com cache"""
-    cache = _cache["price"]
+    """Obtém preço atual com cache de 5 segundos"""
     now = time.time()
     
-    if now - cache["timestamp"] < cache["ttl"]:
-        return cache["value"]
+    if now - _cache["price"]["timestamp"] < 5:
+        return _cache["price"]["value"]
     
-    try:
-        data = await bingx_request("GET", "/openApi/swap/v2/quote/ticker", {"symbol": SYMBOL})
-        if data:
-            price = float(data.get('lastPrice', 0))
-            _cache["price"]["value"] = price
-            _cache["price"]["timestamp"] = now
+    data = await bingx_request("GET", "/openApi/swap/v2/quote/ticker", {"symbol": SYMBOL})
+    
+    if data:
+        if isinstance(data, list) and len(data) > 0:
+            ticker = data[0]
+        elif isinstance(data, dict):
+            ticker = data
+        else:
+            return 0.0
+        
+        if 'lastPrice' in ticker:
+            price = float(ticker['lastPrice'])
+            _cache["price"] = {"value": price, "timestamp": now}
+            logger.log("INFO", f"Preço atualizado", {"price": price})
             return price
-    except:
-        pass
     
     return 0.0
 
-# ... (outras funções de trading mantidas)
-
-# ========== ENDPOINTS DE HEALTH CHECK ==========
-@router.get("/health/13s")
-async def health_check_13s(background_tasks: BackgroundTasks):
-    """Health check interno de 13 segundos"""
-    background_tasks.add_task(health_monitor.check_13s)
+async def get_balance():
+    """Obtém saldo da conta"""
+    data = await bingx_request("GET", "/openApi/swap/v2/user/balance", signed=True)
     
-    # Teste rápido da API BingX
-    try:
-        price = await get_current_price()
-        return {
-            "status": "ok",
-            "check": "13s",
-            "price": price > 0,
-            "timestamp": time.time(),
-            "uptime": time.time() - _metrics["start_time"]
-        }
-    except Exception as e:
-        return {
-            "status": "degraded",
-            "check": "13s",
-            "error": str(e),
-            "timestamp": time.time()
-        }
-
-@router.get("/health/31s")
-async def health_check_31s(background_tasks: BackgroundTasks):
-    """Health check interno de 31 segundos"""
-    background_tasks.add_task(health_monitor.check_31s)
+    if data and 'balance' in data:
+        for asset in data['balance']:
+            if asset.get('asset') == 'USDT':
+                balance = float(asset.get('balance', 0))
+                _cache["balance"] = {"value": balance, "timestamp": time.time()}
+                logger.log("INFO", f"Saldo obtido", {"balance": balance})
+                return balance
     
-    # Teste mais completo
+    return 0.0
+
+async def set_leverage():
+    """Configura alavancagem 1x"""
+    result = await bingx_request("POST", "/openApi/swap/v2/trade/leverage", {
+        "symbol": SYMBOL,
+        "leverage": 1,
+        "side": "LONG"
+    }, signed=True)
+    
+    if result:
+        logger.log("INFO", "Alavancagem configurada para 1x")
+    else:
+        logger.log("WARNING", "Falha ao configurar alavancagem")
+
+async def get_position():
+    """Obtém posição atual"""
+    data = await bingx_request("GET", "/openApi/swap/v2/user/positions", signed=True)
+    
+    if data:
+        if isinstance(data, list):
+            for pos in data:
+                if pos.get('symbol') == SYMBOL:
+                    _cache["position"] = {"value": pos, "timestamp": time.time()}
+                    return pos
+        elif isinstance(data, dict) and data.get('symbol') == SYMBOL:
+            _cache["position"] = {"value": data, "timestamp": time.time()}
+            return data
+    
+    _cache["position"] = {"value": None, "timestamp": time.time()}
+    return None
+
+async def place_market_order(side: str, quantity: float):
+    """Executa ordem de mercado"""
+    params = {
+        "symbol": SYMBOL,
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": round(quantity, 4),
+        "positionSide": "LONG" if side.upper() == "BUY" else "SHORT"
+    }
+    
+    logger.log("INFO", f"Enviando ordem de mercado", {
+        "side": side,
+        "quantity": quantity,
+        "params": params
+    })
+    
+    return await bingx_request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
+
+# ========== PROCESSAMENTO DE SINAIS ==========
+async def execute_action(action: str):
+    """Executa ação baseada no sinal"""
+    logger.log("INFO", f"Iniciando execução da ação", {"action": action})
+    
+    # Configurar alavancagem em background
+    asyncio.create_task(set_leverage())
+    
+    if action == "ENTER-LONG":
+        return await enter_position("BUY")
+    elif action == "ENTER-SHORT":
+        return await enter_position("SELL")
+    elif action == "EXIT-LONG":
+        return await close_position("LONG")
+    elif action == "EXIT-SHORT":
+        return await close_position("SHORT")
+    elif action == "EXIT-ALL":
+        return await close_all_positions()
+    
+    return {"success": False, "error": f"Ação desconhecida: {action}"}
+
+async def enter_position(side: str):
+    """Abre nova posição"""
     try:
-        # Testa múltiplos endpoints da BingX
+        # Obter saldo e preço em paralelo
+        balance_task = asyncio.create_task(get_balance())
         price_task = asyncio.create_task(get_current_price())
         
-        # Teste de conexão básica
-        test_url = "https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=ETH-USDT"
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session:
-            async with session.get(test_url) as resp:
-                api_ok = resp.status == 200
+        balance, price = await asyncio.gather(balance_task, price_task)
         
-        price = await price_task
+        logger.log("INFO", f"Dados para ordem", {
+            "balance": balance,
+            "price": price,
+            "side": side
+        })
         
-        return {
-            "status": "ok",
-            "check": "31s",
-            "api_connected": api_ok,
-            "price_available": price > 0,
-            "timestamp": time.time(),
-            "metrics": {
-                "webhooks": _metrics["webhooks_received"],
-                "trades": _metrics["trades_executed"],
-                "errors": _metrics["errors"]
-            }
-        }
+        if balance <= 0:
+            return {"success": False, "error": "Saldo insuficiente"}
+        
+        if price <= 0:
+            return {"success": False, "error": "Preço inválido"}
+        
+        # Calcular 40% do saldo
+        usd_amount = balance * 0.4
+        quantity = round(usd_amount / price, 4)
+        
+        logger.log("INFO", f"Calculando quantidade", {
+            "usd_amount": usd_amount,
+            "quantity": quantity
+        })
+        
+        if quantity <= 0:
+            return {"success": False, "error": "Quantidade inválida"}
+        
+        # Executar ordem
+        order_result = await place_market_order(side, quantity)
+        
+        if order_result and 'orderId' in order_result:
+            logger.log("SUCCESS", f"Ordem executada com sucesso!", {
+                "order_id": order_result['orderId'],
+                "side": side,
+                "quantity": quantity
+            })
+            _metrics["trades_executed"] += 1
+            _metrics["last_trade_time"] = time.time()
+            return {"success": True, "order_id": order_result['orderId']}
+        else:
+            logger.log("ERROR", f"Falha na execução da ordem", {
+                "order_result": order_result
+            })
+            return {"success": False, "error": "Falha na execução da ordem"}
+            
     except Exception as e:
-        _metrics["errors"] += 1
-        return {
-            "status": "error",
-            "check": "31s",
-            "error": str(e),
-            "timestamp": time.time()
-        }
+        logger.log("ERROR", f"Erro ao abrir posição", {"error": str(e)})
+        return {"success": False, "error": str(e)}
+
+async def close_position(side: str):
+    """Fecha posição existente"""
+    try:
+        position = await get_position()
+        
+        if not position or float(position.get('positionAmt', 0)) == 0:
+            return {"success": True, "message": "Nenhuma posição para fechar"}
+        
+        current_side = "LONG" if float(position['positionAmt']) > 0 else "SHORT"
+        
+        # Verificar se a posição corresponde ao side
+        if (side == "LONG" and current_side == "SHORT") or \
+           (side == "SHORT" and current_side == "LONG"):
+            return {"success": True, "message": "Posição não corresponde"}
+        
+        quantity = abs(float(position['positionAmt']))
+        close_side = "SELL" if current_side == "LONG" else "BUY"
+        
+        order_result = await place_market_order(close_side, quantity)
+        
+        if order_result and 'orderId' in order_result:
+            logger.log("SUCCESS", f"Posição fechada com sucesso!", {
+                "order_id": order_result['orderId'],
+                "side": close_side,
+                "quantity": quantity
+            })
+            _metrics["trades_executed"] += 1
+            return {"success": True}
+        else:
+            return {"success": False, "error": "Falha ao fechar posição"}
+            
+    except Exception as e:
+        logger.log("ERROR", f"Erro ao fechar posição", {"error": str(e)})
+        return {"success": False, "error": str(e)}
+
+async def close_all_positions():
+    """Fecha todas as posições"""
+    position = await get_position()
+    
+    if not position or float(position.get('positionAmt', 0)) == 0:
+        return {"success": True, "message": "Nenhuma posição aberta"}
+    
+    quantity = abs(float(position['positionAmt']))
+    side = "SELL" if float(position['positionAmt']) > 0 else "BUY"
+    
+    order_result = await place_market_order(side, quantity)
+    
+    if order_result and 'orderId' in order_result:
+        logger.log("SUCCESS", "Todas as posições fechadas")
+        return {"success": True}
+    else:
+        return {"success": False, "error": "Falha ao fechar posições"}
+
+# ========== ENDPOINTS ==========
+@router.post("/webhook")
+async def webhook_handler(request: Request):
+    """Endpoint principal para webhooks"""
+    _metrics["webhooks_received"] += 1
+    _metrics["last_webhook_time"] = time.time()
+    
+    start_time = time.perf_counter()
+    
+    try:
+        # Ler corpo da requisição
+        body_bytes = await request.body()
+        
+        if not body_bytes:
+            logger.log("WARNING", "Webhook com corpo vazio")
+            return Response(
+                content=json.dumps({"status": "error", "message": "Empty body"}),
+                media_type="application/json",
+                status_code=400
+            )
+        
+        # Decodificar mensagem
+        try:
+            message = body_bytes.decode('utf-8').strip()
+        except:
+            message = str(body_bytes)
+        
+        logger.log("INFO", f"Webhook recebido", {
+            "message": message,
+            "length": len(message)
+        })
+        
+        # Validar formato
+        match = SIGNAL_PATTERN.match(message)
+        if not match:
+            logger.log("ERROR", f"Formato de sinal inválido", {"message": message})
+            return Response(
+                content=json.dumps({"status": "error", "message": "Invalid signal format"}),
+                media_type="application/json",
+                status_code=400
+            )
+        
+        # Extrair informações
+        action = match.group(1)
+        bot_name = match.group(2)
+        timeframe = match.group(3)
+        signal_id = match.group(4)
+        
+        logger.log("INFO", f"Sinal analisado", {
+            "action": action,
+            "bot_name": bot_name,
+            "timeframe": timeframe,
+            "signal_id": signal_id
+        })
+        
+        # Verificar duplicado
+        if signal_id in _processed_signals:
+            logger.log("INFO", f"Sinal duplicado ignorado", {"signal_id": signal_id})
+            return Response(
+                content=json.dumps({"status": "duplicate"}),
+                media_type="application/json"
+            )
+        
+        _processed_signals.add(signal_id)
+        if len(_processed_signals) > 100:
+            _processed_signals.clear()
+        
+        # Executar ação
+        result = await execute_action(action)
+        
+        execution_time = (time.perf_counter() - start_time) * 1000
+        
+        if result.get("success"):
+            logger.log("SUCCESS", f"Ação executada com sucesso", {
+                "action": action,
+                "execution_time_ms": execution_time
+            })
+            
+            return Response(
+                content=json.dumps({
+                    "status": "success",
+                    "action": action,
+                    "execution_ms": round(execution_time, 2),
+                    "signal_id": signal_id
+                }),
+                media_type="application/json",
+                headers={"X-Exec-Time": f"{execution_time:.2f}ms"}
+            )
+        else:
+            logger.log("ERROR", f"Falha na execução da ação", {
+                "action": action,
+                "error": result.get("error"),
+                "execution_time_ms": execution_time
+            })
+            
+            return Response(
+                content=json.dumps({
+                    "status": "error",
+                    "action": action,
+                    "error": result.get("error", "Unknown error"),
+                    "execution_ms": round(execution_time, 2)
+                }),
+                media_type="application/json",
+                status_code=500
+            )
+            
+    except Exception as e:
+        execution_time = (time.perf_counter() - start_time) * 1000
+        logger.log("ERROR", f"Erro inesperado no webhook", {"error": str(e)})
+        
+        return Response(
+            content=json.dumps({
+                "status": "error",
+                "message": str(e),
+                "execution_ms": round(execution_time, 2)
+            }),
+            media_type="application/json",
+            status_code=500
+        )
 
 @router.get("/status")
 async def status():
-    """Endpoint principal para UptimeRobot"""
-    try:
-        # Testes simultâneos
-        price_task = asyncio.create_task(get_current_price())
-        health_status = health_monitor.get_status()
-        
-        price = await price_task
-        
-        return {
-            "status": "operational",
-            "service": "BingX Trading Bot",
-            "timestamp": time.time(),
-            "uptime": time.time() - _metrics["start_time"],
-            "performance": {
-                "price_cache_ms": int((time.time() - _cache["price"]["timestamp"]) * 1000),
-                "webhooks_processed": _metrics["webhooks_received"],
-                "trades_executed": _metrics["trades_executed"]
-            },
-            "health_checks": health_status,
-            "exchange": {
-                "connected": price > 0,
-                "symbol": SYMBOL,
-                "last_price": price
-            },
-            "keep_alive": {
-                "13s_active": health_status["13s"]["active"],
-                "31s_active": health_status["31s"]["active"],
-                "recommendation": "UptimeRobot deve verificar a cada 1-5 minutos"
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "degraded",
-            "error": str(e),
-            "timestamp": time.time()
-        }
-
-@router.get("/keep-alive/test")
-async def keep_alive_test():
-    """Endpoint específico para testes de keep-alive"""
-    now = time.time()
-    
+    """Endpoint de status"""
     return {
-        "message": "✅ Keep-alive system active",
-        "server_time": time.ctime(now),
-        "unix_timestamp": now,
-        "checks": {
-            "13s_last": health_monitor.last_13s_check,
-            "31s_last": health_monitor.last_31s_check,
-            "13s_active": (now - health_monitor.last_13s_check) < 20,
-            "31s_active": (now - health_monitor.last_31s_check) < 40
+        "status": "running",
+        "service": "BingX Trading Bot",
+        "symbol": SYMBOL,
+        "metrics": {
+            "webhooks_received": _metrics["webhooks_received"],
+            "trades_executed": _metrics["trades_executed"],
+            "errors": _metrics["errors"],
+            "uptime_seconds": time.time() - _metrics["start_time"]
         },
-        "instructions": {
-            "internal_13s": "GET /health/13s a cada 13 segundos",
-            "internal_31s": "GET /health/31s a cada 31 segundos", 
-            "external": "UptimeRobot em GET /status a cada 1-5 minutos",
-            "webhook": "TradingView POST /webhook com sinais"
-        }
-    }
-
-@router.get("/")
-async def root():
-    """Página inicial com informações completas"""
-    return {
-        "service": "BingX Ultra-Fast Trading Bot",
-        "version": "2.0.0",
-        "status": "🟢 OPERATIONAL",
-        "features": {
-            "speed": "<50ms execution",
-            "pair": SYMBOL,
-            "leverage": "1x",
-            "margin": "40% of balance"
-        },
-        "endpoints": {
-            "webhook": "POST /webhook - TradingView signals",
-            "status": "GET /status - Health check (UptimeRobot)",
-            "health_13s": "GET /health/13s - Internal keep-alive",
-            "health_31s": "GET /health/31s - Internal keep-alive",
-            "keep_alive_test": "GET /keep-alive/test - System status"
-        },
-        "anti_shutdown_system": {
-            "internal_13s": "Active every 13 seconds",
-            "internal_31s": "Active every 31 seconds", 
-            "external_monitor": "Required (UptimeRobot)",
-            "render_timeout": "15 minutes without traffic",
-            "recommendation": "Use all three methods to prevent shutdown"
+        "cache": {
+            "price": _cache["price"]["value"],
+            "balance": _cache["balance"]["value"],
+            "has_position": _cache["position"]["value"] is not None
         },
         "timestamp": time.time()
     }
 
-# ========== WEBHOOK ENDPOINT ==========
-@router.post("/webhook")
-async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
-    """Processa sinais do TradingView"""
-    _metrics["webhooks_received"] += 1
-    start_time = time.perf_counter()
-    
+@router.get("/debug")
+async def debug():
+    """Endpoint de debug"""
+    return {
+        "environment": {
+            "api_key_configured": bool(API_KEY),
+            "secret_key_configured": bool(SECRET_KEY),
+            "symbol": SYMBOL
+        },
+        "metrics": _metrics,
+        "cache_info": {
+            "price_age": time.time() - _cache["price"]["timestamp"],
+            "balance_age": time.time() - _cache["balance"]["timestamp"],
+            "position_age": time.time() - _cache["position"]["timestamp"]
+        },
+        "recent_signals": list(_processed_signals)[-10:],
+        "log_count": len(logger.logs)
+    }
+
+@router.get("/webhook/logs")
+async def webhook_logs():
+    """Retorna logs recentes"""
+    return {
+        "logs": logger.get_recent_logs(50),
+        "total_logs": len(logger.logs)
+    }
+
+@router.get("/test/api")
+async def test_api():
+    """Testa conexão com a API BingX"""
     try:
-        # Implementação do webhook mantida
-        # ... (código anterior)
+        # Teste de ticker
+        ticker = await bingx_request("GET", "/openApi/swap/v2/quote/ticker", {"symbol": SYMBOL})
         
-        execution_time = (time.perf_counter() - start_time) * 1000
+        # Teste de saldo (se credenciais existirem)
+        balance = None
+        if API_KEY and SECRET_KEY:
+            balance_data = await bingx_request("GET", "/openApi/swap/v2/user/balance", signed=True)
+            if balance_data and 'balance' in balance_data:
+                for asset in balance_data['balance']:
+                    if asset.get('asset') == 'USDT':
+                        balance = float(asset.get('balance', 0))
         
         return {
-            "status": "success",
-            "execution_ms": round(execution_time, 2),
+            "success": True,
+            "ticker_available": bool(ticker),
+            "balance_available": balance is not None,
+            "balance": balance,
+            "symbol": SYMBOL,
             "timestamp": time.time()
         }
-        
     except Exception as e:
-        _metrics["errors"] += 1
-        execution_time = (time.perf_counter() - start_time) * 1000
-        
         return {
-            "status": "error",
+            "success": False,
             "error": str(e),
-            "execution_ms": round(execution_time, 2),
             "timestamp": time.time()
         }
 
-# ========== INICIALIZAÇÃO ==========
+# ========== CONFIGURAÇÃO DO APP ==========
 app = FastAPI(
-    title="BingX Ultra-Fast Trading Bot",
-    description="Sistema com keep-alive interno para evitar desativação no Render",
-    version="2.0.0",
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None
+    title="BingX Trading Bot - Debug",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url=None
 )
 
-# Middleware
 @app.middleware("http")
-async def add_headers(request: Request, call_next):
+async def log_requests(request: Request, call_next):
+    """Middleware para logar todas as requisições"""
     start_time = time.perf_counter()
+    
     response = await call_next(request)
-    response.headers["X-Process-Time"] = f"{(time.perf_counter() - start_time) * 1000:.2f}ms"
-    response.headers["X-Keep-Alive"] = "13s,31s,external"
+    
+    process_time = (time.perf_counter() - start_time) * 1000
+    
+    # Log apenas para endpoints importantes
+    if request.url.path == "/webhook":
+        logger.log("DEBUG", f"Requisição {request.method} {request.url.path}", {
+            "process_time_ms": process_time,
+            "status_code": response.status_code
+        })
+    
+    response.headers["X-Process-Time"] = f"{process_time:.2f}ms"
     return response
 
 @app.on_event("startup")
 async def startup_event():
-    print("\n" + "=" * 60)
-    print("🔥 SISTEMA ANTI-DESATIVAÇÃO ATIVADO")
-    print("=" * 60)
-    print("✅ Keep-Alive 13s: /health/13s")
-    print("✅ Keep-Alive 31s: /health/31s") 
-    print("✅ Status UptimeRobot: /status")
-    print("✅ Webhook TradingView: /webhook")
-    print("=" * 60)
-    print("⚠️  Configure UptimeRobot para: GET /status a cada 1-5 minutos")
-    print("=" * 60 + "\n")
+    """Evento de inicialização"""
+    logger.log("INFO", "Servidor iniciando...")
+    logger.log("INFO", f"Configuração - Símbolo: {SYMBOL}")
+    logger.log("INFO", f"API Key configurada: {'Sim' if API_KEY else 'Não'}")
+    logger.log("INFO", f"Secret Key configurada: {'Sim' if SECRET_KEY else 'Não'}")
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Evento de desligamento"""
+    logger.log("INFO", "Servidor desligando...")
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+
+# Incluir rotas
 app.include_router(router)
+
+# Rota raiz
+@app.get("/")
+async def root():
+    return {
+        "service": "BingX Ultra-Fast Trading Bot",
+        "status": "🟢 ONLINE",
+        "version": "1.0.0",
+        "debug_mode": True,
+        "endpoints": {
+            "status": "GET /status",
+            "debug": "GET /debug",
+            "webhook": "POST /webhook",
+            "webhook_logs": "GET /webhook/logs",
+            "test_api": "GET /test/api"
+        },
+        "instructions": {
+            "tradingview": "Configure webhook para POST /webhook",
+            "message_format": "ENTER-LONG_BingX_ETH-USDT_BOTNAME_TIMEFRAME_SIGNALID"
+        }
+    }
